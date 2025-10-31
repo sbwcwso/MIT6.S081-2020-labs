@@ -1,0 +1,23 @@
+# Print a page table
+
+Explain the output of vmprint in terms of Fig 3-4 from the text. What does page 0 contain? What is in page 2? When running in user mode, could the process read/write the memory mapped by page 1?
+
+* Page 0 contains the instruction and data of init
+* Page 2 is the process's user stack
+* When running in user mode, the process cannot read/write the memory mapped by page 1. Because the PTE's PTU_U is 0, this page is the guard page.
+
+# Simplify copyin/copyinstr
+
+Explain why the third test srcva + len < srcva is necessary in copyin_new(): give values for srcva and len for which the first two test fail (i.e., they will not cause to return -1) but for which the third one is true (resulting in returning -1).
+
+```c
+  if (srcva >= p->sz || srcva+len >= p->sz || srcva+len < srcva)
+    return -1;
+```
+
+* To avoid data overflow.
+* p->sz = 4096, srcva = 1024, len = 2^64 - 1
+** srcva < p->sz , test fail
+** srcva + len = (2^64 - 1 + 1024 ) % 2^64 = 1023 (overflow) < p->sz, test fail
+** srcva + len (overflow) = 1023 < srcva = 1024, test is true
+
