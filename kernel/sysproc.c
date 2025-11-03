@@ -55,6 +55,7 @@ sys_sbrk(void)
 uint64
 sys_sleep(void)
 {
+  backtrace();
   int n;
   uint ticks0;
 
@@ -85,6 +86,7 @@ sys_kill(void)
 
 // return how many clock tick interrupts have occurred
 // since start.
+
 uint64
 sys_uptime(void)
 {
@@ -94,4 +96,38 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int ticks;
+  uint64 handler;
+
+  if (argint(0, &ticks) < 0)
+    return -1;
+  if (argaddr(1, &handler) < 0)
+    return -1;
+  
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->alarm_handler = handler;
+  p->alarm_interval = ticks;
+  p->remain_ticks = ticks;
+  release(&p->lock);
+
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  if (p->handling_sig){
+    *p->trapframe = *p->sig_trapframe;
+    p->handling_sig = 0;
+  }
+  release(&p->lock);
+  return 0;
 }
