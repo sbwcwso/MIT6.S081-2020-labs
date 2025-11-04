@@ -142,6 +142,7 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  p->stackbase = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -274,6 +275,8 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  np->stackbase = p->stackbase;
 
   np->parent = p;
 
@@ -693,4 +696,29 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int
+lazy_alloc(uint64 va)
+{
+  struct proc *p = myproc();
+  // printf("lazy_alloc: pagetalbe %p\n", p->pagetable);
+  // printf("lazy_alloc: va %p\n", va);
+  if (va >= p->sz || va >= TRAMPOLINE || (va < p->stackbase && va >= p->stackbase - PGSIZE)) {
+    return 0;
+  } else{
+    uint64 ka = (uint64) kalloc();
+    if (ka == 0) {
+      return 0;
+    } else {
+      memset((void *) ka, 0, PGSIZE);
+      va = PGROUNDDOWN(va);
+      if(mappages(p->pagetable, va, PGSIZE, ka, PTE_U|PTE_W|PTE_R) != 0){
+        kfree((void *) ka);
+        return 0;
+      }
+    }
+  }
+
+  return 1;
 }
