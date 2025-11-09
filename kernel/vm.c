@@ -422,12 +422,11 @@ cow_alloc(pagetable_t pagetable, uint64 va)
       return -1;
     }
     cow_count[page_index]--;
-    if (cow_count[page_index] == 1)
+    if (cow_count[page_index] == 1)  // can save a page fault next time
       *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW
   } else {
+    // still need this, because of exec directly replace process page table
     *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW
-    // release(&cowlock);
-    // return -1; // should not happen
   } 
   release(&cowlock);
   return 0;
