@@ -67,7 +67,15 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  } else if (r_scause() == 15) {
+    // handle page fault for copy-on-write
+    uint64 fault_addr = r_stval();
+    if(cow_alloc(p->pagetable, PGROUNDDOWN(fault_addr)) < 0){
+      printf("usertrap(): cow_alloc failed va %p pid=%d\n", fault_addr, p->pid);
+      p->killed = 1;
+    }
+  } 
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;

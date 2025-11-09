@@ -111,6 +111,35 @@ walkaddr(pagetable_t pagetable, uint64 va)
   return pa;
 }
 
+
+// Look up a virtual address, return the physical address,
+// or 0 if not mapped.
+// Can only be used to look up user pages.
+uint64
+walkaddrforwrite(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+
+  if(va >= MAXVA)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return 0;
+  if((*pte & PTE_V) == 0)
+    return 0;
+  if((*pte & PTE_U) == 0)
+    return 0;
+  if((*pte & PTE_W) == 0) {
+    if (cow_alloc(pagetable, va) < 0)
+      return 0;
+    return walkaddr(pagetable, va);
+  }
+  pa = PTE2PA(*pte);
+  return pa;
+}
+
 // add a mapping to the kernel page table.
 // only used when booting.
 // does not flush TLB or enable paging.
@@ -311,28 +340,97 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    pte_t cow_pte = *pte;
+    pa = PTE2PA(cow_pte);
+    // cow_count[PGINDEX(pa)]++; // increment reference count
+    int index = PGINDEX(pa);
+    cow_pte = cow_pte | PTE_COW; // mark as copy-on-write
+    cow_pte = cow_pte & (~PTE_W); // remove write permission
+    *pte = cow_pte; // update parent's PTE
+    flags = PTE_FLAGS(cow_pte);
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
+    acquire(&cowlock);
+    cow_count[index]++;
+    release(&cowlock);
+    // flags = PTE_FLAGS(*pte);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    //   kfree(mem);
+    //   goto err;
+    // }
   }
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+
+int
+cow_alloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+  if(va >= MAXVA)
+    return -1;
+  if((pte = walk(pagetable, va, 0)) == 0) {
+    printf("cow_alloc: walk failed for va %p\n", va);
+    return -1;
+  }
+  if((*pte & PTE_V) == 0){
+    printf("cow_alloc: pte not valid for va %p\n", va);
+    return -1;
+  }
+  if((*pte & PTE_U) == 0) {
+    printf("cow_alloc: pte not user for va %p\n", va);
+    return -1;
+  }
+  if((*pte & PTE_COW) == 0) {
+    printf("cow_alloc: pte not COW for va %p\n", va);
+    return -1;
+  }
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+  int page_index = PGINDEX(pa);
+
+  acquire(&cowlock);
+  if (cow_count[page_index] > 1) {
+    // allocate new page
+    if((mem = kalloc()) == 0) {
+      printf("cow_alloc: kalloc failed for va %p\n", va);
+      release(&cowlock);
+      return -1;
+    }
+    memmove(mem, (char*)pa, PGSIZE);
+    uvmunmap(pagetable, va, 1, 0); // unmap old page
+    if (mappages(pagetable, va, PGSIZE, (uint64)mem, (flags | PTE_W) & ~PTE_COW) != 0) {
+      release(&cowlock);
+      kfree(mem);
+      printf("cow_alloc: mappages failed for va %p\n", va);
+      return -1;
+    }
+    cow_count[page_index]--;
+    if (cow_count[page_index] == 1)
+      *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW
+  } else {
+    *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW
+    // release(&cowlock);
+    // return -1; // should not happen
+  } 
+  release(&cowlock);
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -358,7 +456,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
+    pa0 = walkaddrforwrite(pagetable, va0);
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);

@@ -136,6 +136,7 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  // printf("Freeing process %d\n", p->pid);
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
@@ -150,6 +151,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  // printf("Process freed\n");
 }
 
 // Create a user page table for a given process,
