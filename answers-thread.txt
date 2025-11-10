@@ -1,0 +1,10 @@
+Why are there missing keys with 2 threads, but not with 1 thread? Identify a sequence of events with 2 threads that can lead to a key being missing.
+
+There is a race condition in insert function.
+```c
+e->next = n;
+*p = e;
+```
+
+5 10
+
