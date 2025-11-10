@@ -111,35 +111,6 @@ walkaddr(pagetable_t pagetable, uint64 va)
   return pa;
 }
 
-
-// Look up a virtual address, return the physical address,
-// or 0 if not mapped.
-// Can only be used to look up user pages.
-uint64
-walkaddrforwrite(pagetable_t pagetable, uint64 va)
-{
-  pte_t *pte;
-  uint64 pa;
-
-  if(va >= MAXVA)
-    return 0;
-
-  pte = walk(pagetable, va, 0);
-  if(pte == 0)
-    return 0;
-  if((*pte & PTE_V) == 0)
-    return 0;
-  if((*pte & PTE_U) == 0)
-    return 0;
-  if((*pte & PTE_W) == 0) {
-    if (cow_alloc(pagetable, va) < 0)
-      return 0;
-    return walkaddr(pagetable, va);
-  }
-  pa = PTE2PA(*pte);
-  return pa;
-}
-
 // add a mapping to the kernel page table.
 // only used when booting.
 // does not flush TLB or enable paging.
@@ -414,19 +385,13 @@ cow_alloc(pagetable_t pagetable, uint64 va)
       return -1;
     }
     memmove(mem, (char*)pa, PGSIZE);
-    uvmunmap(pagetable, va, 1, 0); // unmap old page
-    if (mappages(pagetable, va, PGSIZE, (uint64)mem, (flags | PTE_W) & ~PTE_COW) != 0) {
-      release(&cowlock);
-      kfree(mem);
-      printf("cow_alloc: mappages failed for va %p\n", va);
-      return -1;
-    }
+
+    *pte = PA2PTE((uint64)mem) | ((flags | PTE_W) & ~PTE_COW); // map to new page with write permission
+    // acquire(&cowlock);
     cow_count[page_index]--;
-    if (cow_count[page_index] == 1)  // can save a page fault next time
-      *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW
+    // release(&cowlock);
   } else {
-    // still need this, because of exec directly replace process page table
-    *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW
+    *pte = (*pte | PTE_W) & ~PTE_COW; // add write permission and remove COW directly
   } 
   release(&cowlock);
   return 0;
@@ -455,7 +420,17 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddrforwrite(pagetable, va0);
+    if (va0 >= MAXVA)
+      return -1;
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+    if (*pte & PTE_COW && (*pte & PTE_W) == 0) {
+      // need to handle copy-on-write
+      if (cow_alloc(pagetable, va0) < 0)
+        return -1;
+    }
+    pa0 = PTE2PA(*pte);
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);
