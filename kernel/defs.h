@@ -64,8 +64,6 @@ void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
 extern char     *cow_count; // array to keep track of copy-on-write page reference counts
-void            increment_cow_count(uint64);
-void            decrement_cow_count(uint64);
 extern          struct spinlock cowlock;
 
 // log.c
