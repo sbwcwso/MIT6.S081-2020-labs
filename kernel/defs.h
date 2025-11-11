@@ -63,7 +63,7 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
-extern char     *cow_count; // array to keep track of copy-on-write page reference counts
+extern char     cow_count[]; // array to keep track of copy-on-write page reference counts
 extern          struct spinlock cowlock;
 
 // log.c

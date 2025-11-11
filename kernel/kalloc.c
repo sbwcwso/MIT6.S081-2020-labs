@@ -9,12 +9,12 @@
 #include "riscv.h"
 #include "defs.h"
 
-void freerange(void *pa_start, void *pa_end, int cow_pages);
+void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
-char *cow_count; // array to keep track of copy-on-write page reference counts
+char cow_count[PGNUMS]; // array to keep track of copy-on-write page reference counts
 
 struct run {
   struct run *next;
@@ -32,17 +32,18 @@ kinit()
 {
   initlock(&kmem.lock, "kmem");
   initlock(&cowlock, "cow");
-  freerange(end, (void*)PHYSTOP, COWPAGES);
+  memset(cow_count, 1, sizeof(cow_count)); // initialize cow_count array to 1
+  freerange(end, (void*)PHYSTOP);
 }
 
 void
-freerange(void *pa_start, void *pa_end, int cow_pages)
+freerange(void *pa_start, void *pa_end)
 {
   char *p;
-  cow_count = (char*)(PGROUNDUP((uint64)pa_start));
+  p = (char*)(PGROUNDUP((uint64)pa_start));
   // printf("Initializing cow_count array at %p for %d pages\n", cow_count, cow_pages);
-  memset(cow_count, 1, cow_pages * PGSIZE); // set to 1 initially
-  p = (char*)( cow_count + (cow_pages * PGSIZE) );
+  // memset(cow_count, 1, cow_pages * PGSIZE); // set to 1 initially
+  // p = (char*)( cow_count + (cow_pages * PGSIZE) );
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
   // printf("Physical memory allocator initialized\n");

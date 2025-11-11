@@ -46,7 +46,7 @@
 // from physical address 0x80000000 to PHYSTOP.
 #define KERNBASE 0x80000000L
 #define MEMSIZE (128*1024*1024) // 128 MB
-#define COWPAGES (MEMSIZE / 4096 / 4096) // number of pages for COW reference count
+#define PGNUMS (MEMSIZE / PGSIZE)
 #define PHYSTOP (KERNBASE + MEMSIZE)
 #define PGINDEX(pa) ((pa - KERNBASE) / PGSIZE)
 
