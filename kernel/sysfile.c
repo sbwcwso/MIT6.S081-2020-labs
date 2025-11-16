@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -484,3 +485,207 @@ sys_pipe(void)
   }
   return 0;
 }
+
+// allocate a vma page for mmaped file
+int
+alloc_mmap_page(struct proc *p, uint64 va) 
+{
+  if ( va < MMAP_START || va >= TRAPFRAME)
+    return -1;
+  for (int i = 0; i < MAX_MMAP_AREAS; i++) {
+    if (p->mmap_areas[i].in_use == 1) {
+      struct mmap_area *area = &p->mmap_areas[i];
+      if (area->addr <= va && va < area->addr + area->length) {
+        uint64 pa = (uint64)kalloc();
+        if (pa == 0) {
+          return -1;
+        }
+
+        int perm = PTE_U | PTE_V;
+        va = PGROUNDDOWN(va);
+        if (area->prot & PROT_READ) perm |= PTE_R;
+        if (area->prot & PROT_WRITE) perm |= PTE_W;
+        if (mappages(p->pagetable, va, PGSIZE, pa, perm) < 0) {
+          kfree((void*)pa);
+          return -1;
+        }
+
+        memset((void*)pa, 0, PGSIZE);
+
+        ilock(area->file->ip);
+        readi(area->file->ip, 0, pa, va - area->addr + area->offset, PGSIZE);
+        iunlock(area->file->ip);
+        return 0;
+      }
+    }
+  }
+
+  return -1; // the va not in mmap area
+}
+
+uint64 
+sys_mmap(void) 
+{
+
+  uint64 addr;
+  uint64 length;
+  int prot;
+  int flags;
+  int fd;
+  int offset;
+
+  argaddr(0, &addr);
+  argaddr(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(4, &fd);
+  argint(5, &offset);
+
+  if(addr != 0 || length == 0 || offset != 0)
+    return -1;
+
+  length = PGROUNDUP(length);
+  struct proc *p = myproc();
+  int i;
+  for (i = 0; i < MAX_MMAP_AREAS; i++) {
+    if (p->mmap_areas[i].in_use == 0) {
+      p->mmap_areas[i].addr = MMAP_ADDR(i);
+      p->mmap_areas[i].length = length;
+      p->mmap_areas[i].prot = prot;
+      p->mmap_areas[i].flags = flags;
+      struct file *f;
+      if (fd >= NOFILE || (f = p->ofile[fd]) == 0) {
+        return -1;
+      }
+
+      // should be able to map file opened read-only with private writable
+      // check that mmap doesn't allow read/write mapping of a
+      // file opened read-only.
+      if ((prot & PROT_READ) && !f->readable)
+        return -1;
+      if ((prot & PROT_WRITE) && !f->writable && (flags & MAP_SHARED))
+        return -1;
+
+      p->mmap_areas[i].file = filedup(f); // increase file reference count
+
+      p->mmap_areas[i].offset = offset;
+      p->mmap_areas[i].in_use = 1;
+
+      return p->mmap_areas[i].addr;
+    }
+  }
+  release(&p->lock);
+  return -1;
+
+  // return -1;
+}
+
+// Helper function to write back a page to file if needed
+inline void
+munmap_free_page(pagetable_t pagetable, struct mmap_area *area, uint64 va, int write) {
+  uint64 pa = walkaddr(pagetable, va);
+  if (pa) {
+    if (write) {
+      ilock(area->file->ip);
+      writei(area->file->ip, 0, pa, va - area->addr + area->offset, PGSIZE);
+      iunlock(area->file->ip);
+    }
+    uvmunmap(pagetable, va, 1, 1);
+  }
+}
+
+inline void
+munmap_write(pagetable_t pagetable, struct mmap_area *area , uint64 va, int length) {
+  uint64 pa = walkaddr(pagetable, va);
+  if (pa) {
+    ilock(area->file->ip);
+    writei(area->file->ip, 0, pa, va - area->addr + area->offset, length);
+    iunlock(area->file->ip);
+  }
+}
+
+uint64 
+munmap_helper(uint64 addr, uint64 length) 
+{
+  struct proc *p = myproc();
+  for (int i = 0; i < MAX_MMAP_AREAS; i++) {
+    struct mmap_area *area = &p->mmap_areas[i];
+    if (area->in_use == 1 && addr >= area->addr && addr <= area->addr + area->length) {
+
+      uint64 area_end = area->addr + area->length;
+
+      int write = (area->prot & PROT_WRITE) && (area->flags & MAP_SHARED);
+      uint64 start = addr;
+      uint64 end = addr + length;
+      if (end < length)  // overflow
+        return -1;
+      end = end > area_end ? area_end : end;
+      uint64 start_aligned_address = PGROUNDUP(start);
+      uint64 end_aligned_address = PGROUNDDOWN(end);
+      int start_remaining = start_aligned_address - start;
+      int end_remaining = end - end_aligned_address;
+
+      begin_op();
+      for (uint64 va = start_aligned_address; va < end_aligned_address; va += PGSIZE)
+        munmap_free_page(p->pagetable, area, va, write);
+      if (write) {
+        if (start_aligned_address > end_aligned_address)  // only single page
+          munmap_write(p->pagetable, area, start, end - start);
+        else {
+          if (start_remaining)
+            munmap_write(p->pagetable, area, start, start_remaining);
+          if (end_remaining)
+            munmap_write(p->pagetable, area, end_aligned_address, end_remaining);
+        }
+      }
+      end_op();
+
+      if (addr == area->addr && length >= area->length) {
+        // Unmap the whole region
+        if (start_aligned_address > end_aligned_address)  // only single page
+          munmap_free_page(p->pagetable, area, start, 0);
+        else {
+          if (start_remaining)
+            munmap_free_page(p->pagetable, area, start, 0);
+          if (end_remaining)
+            munmap_free_page(p->pagetable, area, end_aligned_address, 0);
+        }
+        fileclose(area->file); // decrease file reference count
+        area->in_use = 0;
+        return 0;
+      } else if (addr == area->addr) {
+        // unmap from the start
+        if (start_aligned_address <= end_aligned_address && start_remaining)
+          munmap_free_page(p->pagetable, area, start, 0);
+        area->addr += length;
+        area->length -= length;
+        return 0;
+      } else if (addr + length >= area->addr + area->length) {
+        // Unmap from the end
+        if (start_aligned_address <= end_aligned_address && end_remaining)
+          munmap_free_page(p->pagetable, area, end_aligned_address, 0);
+        area->length -= length;
+        return 0;
+      } else {
+        // should not happen
+        panic("munmap: invalid munmap request");
+      }
+    }
+  }
+
+  return -1;
+}
+
+// An munmap call might cover only a portion of an mmap-ed region, but you can assume that it will either unmap at the start, or at the end, or the whole region (but not punch a hole in the middle of a region).
+uint64 sys_munmap(void) {
+  uint64 addr;
+  uint64 length;
+
+  argaddr(0, &addr);
+  argaddr(1, &length);
+
+  if (length == 0)
+    return -1;
+
+  return munmap_helper(addr, length);
+} 

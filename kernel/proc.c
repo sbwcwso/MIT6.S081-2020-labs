@@ -296,6 +296,15 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // copy mmap areas
+  for (i = 0; i < MAX_MMAP_AREAS; i++) {
+    if (p->mmap_areas[i].in_use) {
+      np->mmap_areas[i] = p->mmap_areas[i];
+      np->mmap_areas[i].file = filedup(np->mmap_areas[i].file);
+    }
+      // increase file reference count
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -343,6 +352,16 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // close all mmaped areas
+  for (int i = 0; i < MAX_MMAP_AREAS; i++) {
+    if (p->mmap_areas[i].in_use) {
+      if (munmap_helper(p->mmap_areas[i].addr, p->mmap_areas[i].length) < 0) {
+        panic("munmap failed in exit");
+      }
+      p->mmap_areas[i].in_use = 0;
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

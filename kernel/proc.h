@@ -80,6 +80,24 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+
+#define MAX_MMAP_AREAS 16
+#define MAX_MMAP_PAGES ((MAXFILE * BSIZE + PGSIZE - 1) / PGSIZE)
+#define MMAP_START (TRAPFRAME - MAX_MMAP_PAGES * PGSIZE * MAX_MMAP_AREAS)
+#define MMAP_ADDR(i) (MMAP_START + (i) * MAX_MMAP_PAGES * PGSIZE)
+
+struct mmap_area {
+  uint64 addr;       // starting virtual address of the mapping
+  int length;        // length of the mapping in bytes
+  int prot;         // protection flags
+  int flags;        // mapping flags
+  int offset;       // offset in the file
+  int in_use;       // whether this mmap_area is in use
+  struct file *file; // pointer to the file being mapped
+};
+
+
+
 enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
@@ -103,4 +121,5 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct mmap_area mmap_areas[MAX_MMAP_AREAS]; // Memory mappings
 };
