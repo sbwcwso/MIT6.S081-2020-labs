@@ -581,99 +581,129 @@ sys_mmap(void)
 }
 
 // Helper function to write back a page to file if needed
-inline void
-munmap_free_page(pagetable_t pagetable, struct mmap_area *area, uint64 va, int write) {
+// Unified helper: optionally write back len bytes starting at va within page
+// and optionally unmap the full page containing va. Avoids duplicate walkaddr
+// and lock/unlock patterns present in the previous separate helpers.
+static void
+munmap_apply(pagetable_t pagetable, struct mmap_area *area, uint64 va,
+             int len, int do_writeback, int do_unmap)
+{
+  // len may be 0 (when only freeing) or <= PGSIZE for partial boundary writes.
   uint64 pa = walkaddr(pagetable, va);
-  if (pa) {
-    if (write) {
-      ilock(area->file->ip);
-      writei(area->file->ip, 0, pa, va - area->addr + area->offset, PGSIZE);
-      iunlock(area->file->ip);
-    }
-    uvmunmap(pagetable, va, 1, 1);
+  if(pa == 0)
+    return; // page not present; silently ignore (lazy allocation case)
+
+  if(do_writeback && len > 0){
+    ilock(area->file->ip);
+    writei(area->file->ip, 0, pa, va - area->addr + area->offset, len);
+    iunlock(area->file->ip);
+  }
+  if(do_unmap){
+    // uvmunmap expects page-aligned virtual address
+    uint64 pageva = PGROUNDDOWN(va);
+    uvmunmap(pagetable, pageva, 1, 1);
   }
 }
 
-inline void
-munmap_write(pagetable_t pagetable, struct mmap_area *area , uint64 va, int length) {
-  uint64 pa = walkaddr(pagetable, va);
-  if (pa) {
-    ilock(area->file->ip);
-    writei(area->file->ip, 0, pa, va - area->addr + area->offset, length);
-    iunlock(area->file->ip);
+// Helper to handle partial pages at boundaries
+static void
+munmap_handle_partial_pages(pagetable_t pagetable, struct mmap_area *area,
+                            uint64 unmap_start, uint64 unmap_end,
+                            uint64 first_page, uint64 last_page,
+                            int needs_writeback, int final_free)
+{
+  int single_page = (first_page > last_page);
+  if(single_page){
+    int bytes = unmap_end - unmap_start;
+    munmap_apply(pagetable, area, unmap_start, bytes,
+                 needs_writeback, final_free);
+    return;
   }
+  // Start partial
+  uint64 start_bytes = first_page - unmap_start;
+  if(start_bytes > 0)
+    munmap_apply(pagetable, area, unmap_start, start_bytes,
+                 needs_writeback, final_free);
+  // End partial
+  uint64 end_bytes = unmap_end - last_page;
+  if(end_bytes > 0)
+    munmap_apply(pagetable, area, last_page, end_bytes,
+                 needs_writeback, final_free);
 }
 
 uint64 
 munmap_helper(uint64 addr, uint64 length) 
 {
   struct proc *p = myproc();
+  
+  // Find the mmap area containing this address
   for (int i = 0; i < MAX_MMAP_AREAS; i++) {
     struct mmap_area *area = &p->mmap_areas[i];
-    if (area->in_use == 1 && addr >= area->addr && addr <= area->addr + area->length) {
+    if (!area->in_use || addr < area->addr || addr > area->addr + area->length) {
+      continue;  // Not the right area
+    }
 
-      uint64 area_end = area->addr + area->length;
+    // Calculate actual unmap range (clamp to area boundaries)
+    uint64 unmap_start = addr;
+    uint64 unmap_end = addr + length;
+    if (unmap_end < length) {  // Overflow check
+      return -1;
+    }
+    uint64 area_end = area->addr + area->length;
+    if (unmap_end > area_end) {
+      unmap_end = area_end;
+    }
 
-      int write = (area->prot & PROT_WRITE) && (area->flags & MAP_SHARED);
-      uint64 start = addr;
-      uint64 end = addr + length;
-      if (end < length)  // overflow
-        return -1;
-      end = end > area_end ? area_end : end;
-      uint64 start_aligned_address = PGROUNDUP(start);
-      uint64 end_aligned_address = PGROUNDDOWN(end);
-      int start_remaining = start_aligned_address - start;
-      int end_remaining = end - end_aligned_address;
+    // Determine page-aligned boundaries
+    uint64 first_aligned_page = PGROUNDUP(unmap_start);
+    uint64 last_aligned_page = PGROUNDDOWN(unmap_end);
+    
+    // Check if we need to write back to file (MAP_SHARED + writable)
+    int needs_writeback = (area->prot & PROT_WRITE) && (area->flags & MAP_SHARED);
 
-      begin_op();
-      for (uint64 va = start_aligned_address; va < end_aligned_address; va += PGSIZE)
-        munmap_free_page(p->pagetable, area, va, write);
-      if (write) {
-        if (start_aligned_address > end_aligned_address)  // only single page
-          munmap_write(p->pagetable, area, start, end - start);
-        else {
-          if (start_remaining)
-            munmap_write(p->pagetable, area, start, start_remaining);
-          if (end_remaining)
-            munmap_write(p->pagetable, area, end_aligned_address, end_remaining);
-        }
-      }
-      end_op();
+    // Step 1: Free all fully-aligned pages and write them back if needed
+    begin_op();
+    for(uint64 va = first_aligned_page; va < last_aligned_page; va += PGSIZE)
+      munmap_apply(p->pagetable, area, va, PGSIZE, needs_writeback, 1);
 
-      if (addr == area->addr && length >= area->length) {
-        // Unmap the whole region
-        if (start_aligned_address > end_aligned_address)  // only single page
-          munmap_free_page(p->pagetable, area, start, 0);
-        else {
-          if (start_remaining)
-            munmap_free_page(p->pagetable, area, start, 0);
-          if (end_remaining)
-            munmap_free_page(p->pagetable, area, end_aligned_address, 0);
-        }
-        fileclose(area->file); // decrease file reference count
-        area->in_use = 0;
-        return 0;
-      } else if (addr == area->addr) {
-        // unmap from the start
-        if (start_aligned_address <= end_aligned_address && start_remaining)
-          munmap_free_page(p->pagetable, area, start, 0);
-        area->addr += length;
-        area->length -= length;
-        return 0;
-      } else if (addr + length >= area->addr + area->length) {
-        // Unmap from the end
-        if (start_aligned_address <= end_aligned_address && end_remaining)
-          munmap_free_page(p->pagetable, area, end_aligned_address, 0);
-        area->length -= length;
-        return 0;
-      } else {
-        // should not happen
-        panic("munmap: invalid munmap request");
-      }
+    // Step 2: Handle boundary partial pages (writeback only now; free later if whole region)
+    munmap_handle_partial_pages(p->pagetable, area, unmap_start, unmap_end,
+                                first_aligned_page, last_aligned_page,
+                                needs_writeback, 0);
+    end_op();
+
+    // Step 3: Update or remove the area based on what was unmapped
+    int unmapping_whole_region = (addr == area->addr && length >= area->length);
+    int unmapping_from_start = (addr == area->addr);
+    int unmapping_from_end = (unmap_end >= area_end);
+
+    if (unmapping_whole_region) {
+      // Free partial pages (without writeback, already done above)
+      munmap_handle_partial_pages(p->pagetable, area, unmap_start, unmap_end,
+                                  first_aligned_page, last_aligned_page, 0, 1);
+      fileclose(area->file);
+      area->in_use = 0;
+      return 0;
+    } else if (unmapping_from_start) {
+      // Shrink from the start
+      if(first_aligned_page <= last_aligned_page && (first_aligned_page - unmap_start) > 0)
+        munmap_apply(p->pagetable, area, unmap_start, 0, 0, 1);
+      area->addr += length;
+      area->length -= length;
+      return 0;
+    } else if (unmapping_from_end) {
+      // Shrink from the end
+      if(first_aligned_page <= last_aligned_page && (unmap_end - last_aligned_page) > 0)
+        munmap_apply(p->pagetable, area, last_aligned_page, 0, 0, 1);
+      area->length -= length;
+      return 0;
+    } else {
+      // Punching hole in middle - not supported
+      panic("munmap: cannot punch hole in middle of region");
     }
   }
 
-  return -1;
+  return -1;  // Address not found in any mmap area
 }
 
 // An munmap call might cover only a portion of an mmap-ed region, but you can assume that it will either unmap at the start, or at the end, or the whole region (but not punch a hole in the middle of a region).
