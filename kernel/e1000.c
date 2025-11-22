@@ -19,8 +19,7 @@ static struct mbuf *rx_mbufs[RX_RING_SIZE];
 // remember where the e1000's registers live.
 static volatile uint32 *regs;
 
-struct spinlock e1000_lock_trasmit;
-struct spinlock e1000_lock_receive;
+struct spinlock e1000_lock;
 
 // called by pci_init().
 // xregs is the memory address at which the
@@ -30,8 +29,7 @@ e1000_init(uint32 *xregs)
 {
   int i;
 
-  initlock(&e1000_lock_trasmit, "e1000");
-  initlock(&e1000_lock_receive, "e1000");
+  initlock(&e1000_lock, "e1000");
 
   regs = xregs;
 
@@ -106,17 +104,17 @@ e1000_transmit(struct mbuf *m)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after sending.
   //
-
-  acquire(&e1000_lock_trasmit);
+  if (m->len > DATA_MAX)
+    return -1;
+  acquire(&e1000_lock);
   uint32 tdt = regs[E1000_TDT];
   if ((tx_ring[tdt].status & E1000_TXD_STAT_DD) == 0) {
-    release(&e1000_lock_trasmit);
+    release(&e1000_lock);
     return -1;
   }
 
-  if (tx_mbufs[tdt]) {
+  if (tx_mbufs[tdt]) 
     mbuffree(tx_mbufs[tdt]);
-  }
 
   tx_ring[tdt].addr = (uint64) m->head;
   tx_ring[tdt].length = m->len;
@@ -127,7 +125,7 @@ e1000_transmit(struct mbuf *m)
   __sync_synchronize();
 
   regs[E1000_TDT] = (tdt + 1) % TX_RING_SIZE;
-  release(&e1000_lock_trasmit);
+  release(&e1000_lock);
 
 
   return 0;
@@ -146,32 +144,24 @@ e1000_recv(void)
   // Process all available packets in the ring
   // This loop handles the case where more packets have arrived than the ring size
   while (1) {
-    acquire(&e1000_lock_receive);
-    
     uint32 rdt = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
-
-    if ((rx_ring[rdt].status & E1000_RXD_STAT_DD) == 0) {
-      release(&e1000_lock_receive);
+    if ((rx_ring[rdt].status & E1000_RXD_STAT_DD) == 0) 
       break;  // No more packets ready
-    }
-
+    
+    __sync_synchronize();
     rx_mbufs[rdt]->len = rx_ring[rdt].length;
-    struct mbuf *m = rx_mbufs[rdt];
+    if(rx_ring[rdt].length > MBUF_SIZE)
+      panic("e1000_recv: length too large");
+    net_rx(rx_mbufs[rdt]);
 
-    struct mbuf *new_mbuf = mbufalloc(0);
-    if (!new_mbuf)
+    rx_mbufs[rdt] = mbufalloc(0);
+    if (!rx_mbufs[rdt])
       panic("e1000_recv: mbufalloc failed");
-    rx_ring[rdt].addr = (uint64) new_mbuf->head;
-    rx_ring[rdt].status = 0;  // Clear DD bit before updating RDT
-    rx_mbufs[rdt] = new_mbuf;
-
+    rx_ring[rdt].addr = (uint64) rx_mbufs[rdt]->head;
+    rx_ring[rdt].status = 0; 
     __sync_synchronize();
 
     regs[E1000_RDT] = rdt;
-    
-    release(&e1000_lock_receive);
-    
-    net_rx(m);
   }
 }
 
