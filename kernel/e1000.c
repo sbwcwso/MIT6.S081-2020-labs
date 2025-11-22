@@ -119,7 +119,7 @@ e1000_transmit(struct mbuf *m)
   tx_ring[tdt].addr = (uint64) m->head;
   tx_ring[tdt].length = m->len;
   tx_ring[tdt].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
-  tx_ring[tdt].status = 0;  // Clear status (will be set by hardware)
+  tx_ring[tdt].status = 0; 
   tx_mbufs[tdt] = m;
 
   __sync_synchronize();
