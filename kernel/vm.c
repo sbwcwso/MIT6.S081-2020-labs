@@ -253,6 +253,7 @@ kvmcreate()
   if(pagetable == 0)
     return 0;
   memset(pagetable, 0, PGSIZE);
+  // copy from first level of kernel_pagetable
   int offset = KERNBASE >> 30;
   int size = (PHYSTOP - KERNBASE + (1 << 30) - 1) >> 30; 
   memmove(pagetable + offset, kernel_pagetable + offset, size * sizeof(uint64));
