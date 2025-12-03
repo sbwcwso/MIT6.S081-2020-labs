@@ -23,33 +23,99 @@
 #include "fs.h"
 #include "buf.h"
 
+#define BUCKETS 13
+
+struct bucket {
+  struct spinlock lock;
+  struct buf head;
+  char lock_name[20];
+} buckets[BUCKETS];
+
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
-
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
 } bcache;
+
+// Min-heap of free buffers keyed by ticks.
+static struct buf* free_buf_heap[NBUF];
+static int free_buf_heap_size = 0;
+
+static inline void
+heap_swap(int i, int j)
+{
+  struct buf* t = free_buf_heap[i];
+  free_buf_heap[i] = free_buf_heap[j];
+  free_buf_heap[j] = t;
+}
+
+static inline int
+heap_less(int i, int j)
+{
+  return free_buf_heap[i]->ticks < free_buf_heap[j]->ticks;
+}
+
+static inline void
+heapify_down(int i)
+{
+  while (1) {
+    int l = 2*i + 1;
+    int r = 2*i + 2;
+    int smallest = i;
+    if (l < free_buf_heap_size && heap_less(l, smallest)) smallest = l;
+    if (r < free_buf_heap_size && heap_less(r, smallest)) smallest = r;
+    if (smallest == i) break;
+    heap_swap(i, smallest);
+    i = smallest;
+  }
+}
+
+static inline void
+build_min_heap()
+{
+  for (int i = (free_buf_heap_size/2) - 1; i >= 0; i--)
+    heapify_down(i);
+}
+
+static struct buf*
+heap_pop_min()
+{
+  struct buf* min = free_buf_heap[0];
+  free_buf_heap[0] = free_buf_heap[free_buf_heap_size - 1];
+  free_buf_heap_size = free_buf_heap_size - 1;
+  heapify_down(0);
+  return min;
+}
 
 void
 binit(void)
 {
-  struct buf *b;
 
   initlock(&bcache.lock, "bcache");
-
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+  for (int i = 0; i < BUCKETS; i++) {
+    snprintf(buckets[i].lock_name, sizeof(buckets[i].lock_name), "bcache.bucket.%d", i);
+    initlock(&buckets[i].lock, buckets[i].lock_name);
+    buckets[i].head.next = &buckets[i].head;
+    buckets[i].head.prev = &buckets[i].head;
   }
+
+  for(int i = 0; i < NBUF; i++) {
+    free_buf_heap[i] = bcache.buf + i;
+    initsleeplock(&bcache.buf[i].lock, "buffer");
+  }
+  free_buf_heap_size = NBUF;
+}
+
+static inline struct buf* find_in_bucket(struct bucket *bucket, uint dev, uint blockno) {
+  acquire(&bucket->lock);
+  for (struct buf *b = bucket->head.next; b != &bucket->head; b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      b->refcnt++;
+      release(&bucket->lock);
+      return b;
+    }
+  }
+  release(&bucket->lock);
+  return 0;
 }
 
 // Look through buffer cache for block on device dev.
@@ -58,34 +124,66 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
-  struct buf *b;
 
-  acquire(&bcache.lock);
-
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
+  int bucket_idx = (dev + blockno) % BUCKETS;
+  struct bucket *bucket = &buckets[bucket_idx];
+  struct buf *b = find_in_bucket(bucket, dev, blockno);
+  if (b != 0) {
+    acquiresleep(&b->lock);
+    return b;
   }
-
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
+
+  acquire(&bcache.lock);
+  // find again, in case another cpu added it
+  b = find_in_bucket(bucket, dev, blockno);
+  if (b != 0) {
+    release(&bcache.lock);
+    acquiresleep(&b->lock);
+    return b;
   }
-  panic("bget: no buffers");
+
+  if (free_buf_heap_size == 0) {
+    // build the heap
+    for (int i = 0; i < BUCKETS; i++) {
+      struct bucket *bkt = &buckets[i];
+      acquire(&bkt->lock);
+      for (struct buf *buf = bkt->head.next; buf != &bkt->head; buf = buf->next) {
+        if (buf->refcnt == 0) {
+          free_buf_heap[free_buf_heap_size++] = buf;
+          buf->prev->next = buf->next;
+          buf->next->prev = buf->prev;
+        }
+      }
+      release(&bkt->lock);
+    }
+    if (free_buf_heap_size == 0) {
+      release(&bcache.lock);
+      panic("bget: no free buffers");
+    }
+    build_min_heap();
+  }
+
+  struct buf *buf = heap_pop_min();
+  buf->refcnt = 1;
+
+  buf->dev = dev;
+  buf->blockno = blockno;
+  buf->valid = 0;
+
+  acquire(&bucket->lock);
+  buf->next = bucket->head.next;
+  buf->prev = &bucket->head;
+  bucket->head.next->prev = buf;
+  bucket->head.next = buf;
+  release(&bucket->lock);
+
+  release(&bcache.lock);
+
+  acquiresleep(&buf->lock);
+  return buf;
+  
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -121,33 +219,32 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  int bucket_idx = (b->dev + b->blockno) % BUCKETS;
+  struct bucket *bucket = &buckets[bucket_idx];
+  acquire(&bucket->lock);
   b->refcnt--;
   if (b->refcnt == 0) {
     // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->ticks = ticks;  // Update ticks on release
   }
-  
-  release(&bcache.lock);
+  release(&bucket->lock);
+
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int bucket_idx = (b->dev + b->blockno) % BUCKETS;
+  struct bucket *bucket = &buckets[bucket_idx];
+  acquire(&bucket->lock);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bucket->lock);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int bucket_idx = (b->dev + b->blockno) % BUCKETS;
+  struct bucket *bucket = &buckets[bucket_idx];
+  acquire(&bucket->lock);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bucket->lock);
 }
-
-
