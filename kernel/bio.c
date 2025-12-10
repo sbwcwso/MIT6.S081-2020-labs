@@ -149,11 +149,12 @@ bget(uint dev, uint blockno)
     for (int i = 0; i < BUCKETS; i++) {
       struct bucket *bkt = &buckets[i];
       acquire(&bkt->lock);
-      for (struct buf *buf = bkt->head.next; buf != &bkt->head; buf = buf->next) {
+      for (struct buf *buf = bkt->head.prev; buf != &bkt->head; buf = buf->prev) {
         if (buf->refcnt == 0) {
           free_buf_heap[free_buf_heap_size++] = buf;
           buf->prev->next = buf->next;
           buf->next->prev = buf->prev;
+          break;
         }
       }
       release(&bkt->lock);
@@ -226,6 +227,13 @@ brelse(struct buf *b)
   if (b->refcnt == 0) {
     // no one is waiting for it.
     b->ticks = ticks;  // Update ticks on release
+    // move to the head of the bucket's list
+    b->prev->next = b->next;
+    b->next->prev = b->prev;
+    b->next = bucket->head.next;
+    b->prev = &bucket->head;
+    bucket->head.next->prev = b;
+    bucket->head.next = b;
   }
   release(&bucket->lock);
 
