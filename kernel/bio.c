@@ -36,8 +36,19 @@ struct {
   struct buf buf[NBUF];
 } bcache;
 
-static struct buf free_buffers;
+static struct buf lru_free_buffers;
 
+static inline void insert_to_lru_free_buffers(struct buf *b) {
+  // insert b to lru_free_buffers in order of ticks
+  struct buf *p = lru_free_buffers.fnext;
+  while (p != &lru_free_buffers && p->ticks < b->ticks) {
+    p = p->fnext;
+  }
+  b->fnext = p;
+  b->fprev = p->fprev;
+  p->fprev->fnext = b;
+  p->fprev = b;
+}
 
 void
 binit(void)
@@ -51,15 +62,15 @@ binit(void)
     buckets[i].head.prev = &buckets[i].head;
   }
 
-  free_buffers.next = &free_buffers;
-  free_buffers.prev = &free_buffers;
+  lru_free_buffers.fnext = &lru_free_buffers;
+  lru_free_buffers.fprev = &lru_free_buffers;
   for(int i = 0; i < NBUF; i++) {
     struct buf *b = &bcache.buf[i];
     // add to free list
-    b->next = free_buffers.next;
-    b->prev = &free_buffers;
-    free_buffers.next->prev = b;
-    free_buffers.next = b;
+    b->fnext = lru_free_buffers.fnext;
+    b->fprev = &lru_free_buffers;
+    lru_free_buffers.fnext->fprev = b;
+    lru_free_buffers.fnext = b;
     initsleeplock(&bcache.buf[i].lock, "buffer");
   }
 }
@@ -103,43 +114,41 @@ bget(uint dev, uint blockno)
     return b;
   }
 
-  if (free_buffers.next == &free_buffers) {
+  if (lru_free_buffers.fnext == &lru_free_buffers) {
     // reclaim buffers from buckets, at most one from each
-    for (int i = 0; i < BUCKETS; i++) {
-      struct bucket *bkt = &buckets[i];
-      struct buf *free_buf = 0;
-      acquire(&bkt->lock);
-      for (struct buf *buf = bkt->head.prev; buf != &bkt->head; buf = buf->prev) {
-        if (buf->refcnt == 0) {
-          free_buf = buf;
-          buf->prev->next = buf->next;
-          buf->next->prev = buf->prev;
-          break;
-        }
+empty:
+    for (int i = 0; i < NBUF; i++) {
+      struct buf *buf = &bcache.buf[i];
+      if (buf->refcnt == 0) {
+        insert_to_lru_free_buffers(buf);
       }
-      release(&bkt->lock);
-      if (free_buf) {
-        // add to free list in order of ticks
-        struct buf *p = free_buffers.next;
-        while (p != &free_buffers && p->ticks < free_buf->ticks) {
-          p = p->next;
-        }
-        free_buf->next = p;
-        free_buf->prev = p->prev;
-        p->prev->next = free_buf;
-        p->prev = free_buf;
-      }
-    }
-    if (free_buffers.next == &free_buffers) {
-      release(&bcache.lock);
-      panic("bget: no free buffers");
     }
   }
 
-  struct buf *buf = free_buffers.next;
+  struct buf *buf;
+non_empty:
+  buf = lru_free_buffers.fnext;
+  if (buf == &lru_free_buffers) 
+    goto empty;
   // remove from free list
-  free_buffers.next = buf->next;
-  buf->next->prev = &free_buffers;
+  lru_free_buffers.fnext = buf->fnext;
+  buf->fnext->fprev = &lru_free_buffers;
+  if (buf->valid) {
+    int old_bucket_idx = (buf->dev + buf->blockno) % BUCKETS;
+    struct bucket *old_bucket = &buckets[old_bucket_idx];
+    acquire(&old_bucket->lock);
+    if (buf->refcnt != 0) {
+      // someone hold it again
+      // The buf may also be hold and the free, this will update the ticks, 
+      // which will break the LRU rule. 
+      release(&old_bucket->lock);
+      goto non_empty;
+    }
+    // remove from old bucket
+    buf->prev->next = buf->next;
+    buf->next->prev = buf->prev;
+    release(&old_bucket->lock);
+  } 
 
   buf->refcnt = 1;
   buf->dev = dev;
