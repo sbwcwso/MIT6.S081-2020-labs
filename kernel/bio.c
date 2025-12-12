@@ -36,55 +36,8 @@ struct {
   struct buf buf[NBUF];
 } bcache;
 
-// Min-heap of free buffers keyed by ticks.
-static struct buf* free_buf_heap[NBUF];
-static int free_buf_heap_size = 0;
+static struct buf free_buffers;
 
-static inline void
-heap_swap(int i, int j)
-{
-  struct buf* t = free_buf_heap[i];
-  free_buf_heap[i] = free_buf_heap[j];
-  free_buf_heap[j] = t;
-}
-
-static inline int
-heap_less(int i, int j)
-{
-  return free_buf_heap[i]->ticks < free_buf_heap[j]->ticks;
-}
-
-static inline void
-heapify_down(int i)
-{
-  while (1) {
-    int l = 2*i + 1;
-    int r = 2*i + 2;
-    int smallest = i;
-    if (l < free_buf_heap_size && heap_less(l, smallest)) smallest = l;
-    if (r < free_buf_heap_size && heap_less(r, smallest)) smallest = r;
-    if (smallest == i) break;
-    heap_swap(i, smallest);
-    i = smallest;
-  }
-}
-
-static inline void
-build_min_heap()
-{
-  for (int i = (free_buf_heap_size/2) - 1; i >= 0; i--)
-    heapify_down(i);
-}
-
-static struct buf*
-heap_pop_min()
-{
-  struct buf* min = free_buf_heap[0];
-  free_buf_heap[0] = free_buf_heap[free_buf_heap_size - 1];
-  free_buf_heap_size = free_buf_heap_size - 1;
-  heapify_down(0);
-  return min;
-}
 
 void
 binit(void)
@@ -98,11 +51,17 @@ binit(void)
     buckets[i].head.prev = &buckets[i].head;
   }
 
+  free_buffers.next = &free_buffers;
+  free_buffers.prev = &free_buffers;
   for(int i = 0; i < NBUF; i++) {
-    free_buf_heap[i] = bcache.buf + i;
+    struct buf *b = &bcache.buf[i];
+    // add to free list
+    b->next = free_buffers.next;
+    b->prev = &free_buffers;
+    free_buffers.next->prev = b;
+    free_buffers.next = b;
     initsleeplock(&bcache.buf[i].lock, "buffer");
   }
-  free_buf_heap_size = NBUF;
 }
 
 static inline struct buf* find_in_bucket(struct bucket *bucket, uint dev, uint blockno) {
@@ -144,31 +103,45 @@ bget(uint dev, uint blockno)
     return b;
   }
 
-  if (free_buf_heap_size == 0) {
-    // build the heap
+  if (free_buffers.next == &free_buffers) {
+    // reclaim buffers from buckets, at most one from each
     for (int i = 0; i < BUCKETS; i++) {
       struct bucket *bkt = &buckets[i];
+      struct buf *free_buf = 0;
       acquire(&bkt->lock);
       for (struct buf *buf = bkt->head.prev; buf != &bkt->head; buf = buf->prev) {
         if (buf->refcnt == 0) {
-          free_buf_heap[free_buf_heap_size++] = buf;
+          free_buf = buf;
           buf->prev->next = buf->next;
           buf->next->prev = buf->prev;
           break;
         }
       }
       release(&bkt->lock);
+      if (free_buf) {
+        // add to free list in order of ticks
+        struct buf *p = free_buffers.next;
+        while (p != &free_buffers && p->ticks < free_buf->ticks) {
+          p = p->next;
+        }
+        free_buf->next = p;
+        free_buf->prev = p->prev;
+        p->prev->next = free_buf;
+        p->prev = free_buf;
+      }
     }
-    if (free_buf_heap_size == 0) {
+    if (free_buffers.next == &free_buffers) {
       release(&bcache.lock);
       panic("bget: no free buffers");
     }
-    build_min_heap();
   }
 
-  struct buf *buf = heap_pop_min();
-  buf->refcnt = 1;
+  struct buf *buf = free_buffers.next;
+  // remove from free list
+  free_buffers.next = buf->next;
+  buf->next->prev = &free_buffers;
 
+  buf->refcnt = 1;
   buf->dev = dev;
   buf->blockno = blockno;
   buf->valid = 0;
