@@ -41,7 +41,7 @@ static struct buf lru_free_buffers;
 static inline void insert_to_lru_free_buffers(struct buf *b) {
   // insert b to lru_free_buffers in order of ticks
   struct buf *p = lru_free_buffers.fnext;
-  while (p != &lru_free_buffers && p->ticks < b->ticks) {
+  while (p != &lru_free_buffers && p->oldticks < b->oldticks) {
     p = p->fnext;
   }
   b->fnext = p;
@@ -120,6 +120,7 @@ empty:
     for (int i = 0; i < NBUF; i++) {
       struct buf *buf = &bcache.buf[i];
       if (buf->refcnt == 0) {
+        buf->oldticks = buf->ticks;
         insert_to_lru_free_buffers(buf);
       }
     }
@@ -137,10 +138,9 @@ non_empty:
     int old_bucket_idx = (buf->dev + buf->blockno) % BUCKETS;
     struct bucket *old_bucket = &buckets[old_bucket_idx];
     acquire(&old_bucket->lock);
-    if (buf->refcnt != 0) {
+    if (buf->refcnt != 0 || buf->ticks != buf->oldticks) {
       // someone hold it again
-      // The buf may also be hold and the free, this will update the ticks, 
-      // which will break the LRU rule. 
+      // or it was used then free again, so the ticks changed
       release(&old_bucket->lock);
       goto non_empty;
     }

@@ -4,6 +4,7 @@ struct buf {
   uint dev;
   uint blockno;
   uint ticks;  // For LRU tracking
+  uint oldticks; // For LRU tracking
   struct sleeplock lock;
   uint refcnt;
   struct buf *prev; // bucket list
